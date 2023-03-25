@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -9,38 +10,73 @@ import (
 )
 
 type Bundler struct {
-	hashes          map[string][]*pubsub.Message
+	config          Config
+	queue           map[string]Messages
 	jobs            chan job
 	results         chan bool
-	countThreshold  int
-	delayThreshold  time.Duration
 	ticker          *time.Ticker
-	routines        int
 	addMutex        sync.Mutex
 	deleteMutex     sync.Mutex
 	processingMutex sync.Mutex
 	processing      bool
 }
 
-type job struct {
-	hash     string
-	messages []*pubsub.Message
+type Config struct {
+	CountThreshold int
+	DelayThreshold time.Duration
+	NumGoroutines  int
+	Processor      func(key string, messages Messages)
 }
 
-func (b *Bundler) Add(hash string, msg *pubsub.Message) {
+func (c *Config) validate() error {
+	switch {
+	case c.CountThreshold < 1:
+		return errors.New("must be greater than zero: CountThreshold")
+	case c.DelayThreshold < 1:
+		return errors.New("must be greater than zero: DelayThreshold")
+	case c.NumGoroutines < 1:
+		return errors.New("must be greater than zero: NumGoroutines")
+	case c.Processor == nil:
+		return errors.New("missing field: Processor")
+	}
+
+	return nil
+}
+
+type Messages []*pubsub.Message
+
+func (m Messages) Ack() {
+	for _, msg := range m {
+		msg.Ack()
+		acked.Add(1)
+	}
+}
+
+func (m Messages) Nack() {
+	for _, msg := range m {
+		msg.Nack()
+	}
+}
+
+type job struct {
+	key      string
+	messages Messages
+}
+
+func (b *Bundler) Add(key string, msg *pubsub.Message) {
 	start := time.Now()
 	fmt.Println("acquiring lock..")
 	b.addMutex.Lock()
 	fmt.Printf("lock acquired in %v\n", time.Since(start))
 	defer b.addMutex.Unlock()
 
-	if _, exists := b.hashes[hash]; !exists {
-		b.hashes[hash] = make([]*pubsub.Message, 0, 1)
+	if _, exists := b.queue[key]; !exists {
+		b.queue[key] = make(Messages, 0, 1)
 	}
 
-	b.hashes[hash] = append(b.hashes[hash], msg)
+	b.queue[key] = append(b.queue[key], msg)
 
-	if len(b.hashes) >= b.countThreshold {
+	if len(b.queue) >= b.config.CountThreshold {
 		b.processQueue()
 	}
 }
@@ -49,24 +85,24 @@ func (b *Bundler) processQueue() {
 	b.processingMutex.Lock()
 
 	defer func() {
-		b.ticker.Reset(b.delayThreshold)
+		b.ticker.Reset(b.config.DelayThreshold)
 		b.processing = false
 		b.processingMutex.Unlock()
 	}()
 
-	if len(b.hashes) == 0 {
+	if len(b.queue) == 0 {
 		return
 	}
 
 	start := time.Now()
-	fmt.Printf("starting processing of %d hashes...\n", len(b.hashes))
+	fmt.Printf("starting processing of queue (size: %d)...\n", len(b.queue))
 	b.processing = true
 
 	// Extract all jobs to prevent concurrent map operations
-	jobs := make([]job, 0, len(b.hashes))
-	for hash, msgs := range b.hashes {
+	jobs := make([]job, 0, len(b.queue))
+	for key, msgs := range b.queue {
 		jobs = append(jobs, job{
-			hash:     hash,
+			key:      key,
 			messages: msgs,
 		})
 	}
@@ -81,26 +117,25 @@ func (b *Bundler) processQueue() {
 		<-b.results
 	}
 
-	fmt.Printf("bundle processing of %d hashes complete in %v\n", len(jobs), time.Since(start))
+	fmt.Printf("processing of queue (size: %d) complete in %v\n", len(jobs), time.Since(start))
 }
 
-func (b *Bundler) startWorker() {
+func (b *Bundler) jobWorker() {
 	for j := range b.jobs {
 		b.processJob(j)
 	}
 }
 
-func (b *Bundler) processJob(job job) {
-	fmt.Printf("processing hash %s with %d messages\n", job.hash, len(job.messages))
-	time.Sleep(mockOperationLatency)
-	for _, msg := range job.messages {
-		msg.Ack()
-		acked.Add(1)
-	}
+func (b *Bundler) processJob(j job) {
+	fmt.Printf("processing key %s with %d messages\n", j.key, len(j.messages))
+	b.config.Processor(j.key, j.messages)
 
+	// Remove this from the queue
 	b.deleteMutex.Lock()
-	delete(b.hashes, job.hash)
+	delete(b.queue, j.key)
 	b.deleteMutex.Unlock()
+
+	// Tell the queue processor that we're done
 	b.results <- true
 }
 
@@ -123,22 +158,24 @@ func (b *Bundler) startTicker() {
 	}()
 }
 
-func NewBundler(countThreshold int, delayThreshold time.Duration, routines int) *Bundler {
+func NewBundler(cfg Config) (*Bundler, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	b := &Bundler{
-		hashes:         make(map[string][]*pubsub.Message),
-		jobs:           make(chan job, routines),
-		results:        make(chan bool, countThreshold),
-		countThreshold: countThreshold,
-		delayThreshold: delayThreshold,
-		ticker:         time.NewTicker(delayThreshold),
-		routines:       routines,
+		config:  cfg,
+		queue:   make(map[string]Messages),
+		jobs:    make(chan job, cfg.NumGoroutines),
+		results: make(chan bool, cfg.CountThreshold),
+		ticker:  time.NewTicker(cfg.DelayThreshold),
 	}
 	b.startTicker()
 
-	for i := 0; i < routines; i++ {
-		fmt.Printf("starting queue worker #%d\n", i+1)
-		go b.startWorker()
+	for i := 0; i < cfg.NumGoroutines; i++ {
+		fmt.Printf("starting queue job worker #%d\n", i+1)
+		go b.jobWorker()
 	}
 
-	return b
+	return b, nil
 }

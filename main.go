@@ -14,12 +14,12 @@ const (
 	messagesToPublish           = 2000
 	bundlerCountThreshold       = 48
 	bundlerDelayThreshold       = 2 * time.Second
-	bundlerGoRoutines           = 12
+	bundlerGoroutines           = 12
 	topicGoroutines             = 3
 	topicMaxExtension           = 10 * time.Minute
 	topicMaxOutstandingMessages = 200
 	mockOperationLatency        = 100 * time.Millisecond
-	statusReportDelay           = 3 * time.Second
+	statusReportDelay           = 1 * time.Second
 	maxHashDuplicates           = 30
 )
 
@@ -31,7 +31,17 @@ var (
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := newPubSub()
-	bundler := NewBundler(bundlerCountThreshold, bundlerDelayThreshold, bundlerGoRoutines)
+
+	bundler, err := NewBundler(Config{
+		CountThreshold: bundlerCountThreshold,
+		DelayThreshold: bundlerDelayThreshold,
+		NumGoroutines:  bundlerGoroutines,
+		Processor: func(key string, messages Messages) {
+			time.Sleep(mockOperationLatency)
+			messages.Ack()
+		},
+	})
+	checkError(err)
 
 	// Publish message
 	p.PublishMesages()
@@ -41,7 +51,7 @@ func main() {
 
 	// Consume the messages
 	fmt.Println("starting message consumption")
-	err := p.subscription.Receive(ctx, func(ctx context.Context, message *pubsub.Message) {
+	err = p.subscription.Receive(ctx, func(ctx context.Context, message *pubsub.Message) {
 		consumed.Add(1)
 		fmt.Println("message received")
 		bundler.Add(string(message.Data), message)
@@ -78,6 +88,7 @@ func statusReport(cancel context.CancelFunc) {
 				fmt.Println("all done.. shutting down")
 				fmt.Printf("processed %d messages with max throughput: %f/s\n", ackedCount, maxThroughout)
 				cancel()
+				return
 			}
 		}
 	}
