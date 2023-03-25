@@ -11,16 +11,17 @@ import (
 )
 
 const (
-	messagesToPublish           = 2000
-	bundlerCountThreshold       = 48
-	bundlerDelayThreshold       = 2 * time.Second
-	bundlerGoroutines           = 12
-	topicGoroutines             = 3
-	topicMaxExtension           = 10 * time.Minute
-	topicMaxOutstandingMessages = 200
-	mockOperationLatency        = 100 * time.Millisecond
-	statusReportDelay           = 1 * time.Second
-	maxHashDuplicates           = 30
+	messagesToPublish            = 2000
+	bundlerKeyCountThreshold     = 48
+	bundlerMessageCountThreshold = 100
+	bundlerDelayThreshold        = 2 * time.Second
+	bundlerGoroutines            = 12
+	topicGoroutines              = 3
+	topicMaxExtension            = 10 * time.Minute
+	topicMaxOutstandingMessages  = 200
+	mockOperationLatency         = 100 * time.Millisecond
+	statusReportDelay            = 1 * time.Second
+	maxHashDuplicates            = 30
 )
 
 var (
@@ -33,9 +34,10 @@ func main() {
 	p := newPubSub()
 
 	bundler, err := NewBundler(Config{
-		CountThreshold: bundlerCountThreshold,
-		DelayThreshold: bundlerDelayThreshold,
-		NumGoroutines:  bundlerGoroutines,
+		KeyCountThreshold:     bundlerKeyCountThreshold,
+		MessageCountThreshold: bundlerMessageCountThreshold,
+		DelayThreshold:        bundlerDelayThreshold,
+		NumGoroutines:         bundlerGoroutines,
 		Processor: func(key string, messages Messages) {
 			time.Sleep(mockOperationLatency)
 			messages.Ack()

@@ -12,8 +12,9 @@ import (
 type Bundler struct {
 	config          Config
 	queue           map[string]Messages
+	messageCount    int
 	jobs            chan job
-	results         chan bool
+	results         chan struct{}
 	ticker          *time.Ticker
 	addMutex        sync.Mutex
 	deleteMutex     sync.Mutex
@@ -22,16 +23,17 @@ type Bundler struct {
 }
 
 type Config struct {
-	CountThreshold int
-	DelayThreshold time.Duration
-	NumGoroutines  int
-	Processor      func(key string, messages Messages)
+	KeyCountThreshold     int
+	MessageCountThreshold int
+	DelayThreshold        time.Duration
+	NumGoroutines         int
+	Processor             func(key string, messages Messages)
 }
 
 func (c *Config) validate() error {
 	switch {
-	case c.CountThreshold < 1:
-		return errors.New("must be greater than zero: CountThreshold")
+	case c.KeyCountThreshold < 1:
+		return errors.New("must be greater than zero: KeyCountThreshold")
 	case c.DelayThreshold < 1:
 		return errors.New("must be greater than zero: DelayThreshold")
 	case c.NumGoroutines < 1:
@@ -75,10 +77,21 @@ func (b *Bundler) Add(key string, msg *pubsub.Message) {
 	}
 
 	b.queue[key] = append(b.queue[key], msg)
+	b.messageCount++
 
-	if len(b.queue) >= b.config.CountThreshold {
+	if b.isQueueFull() {
 		b.processQueue()
 	}
+}
+
+func (b *Bundler) isQueueFull() bool {
+	switch {
+	case b.config.KeyCountThreshold > 0 && len(b.queue) >= b.config.KeyCountThreshold:
+		return true
+	case b.config.MessageCountThreshold > 0 && b.messageCount >= b.config.MessageCountThreshold:
+		return true
+	}
+	return false
 }
 
 func (b *Bundler) processQueue() {
@@ -87,6 +100,7 @@ func (b *Bundler) processQueue() {
 	defer func() {
 		b.ticker.Reset(b.config.DelayThreshold)
 		b.processing = false
+		b.messageCount = 0
 		b.processingMutex.Unlock()
 	}()
 
@@ -95,7 +109,7 @@ func (b *Bundler) processQueue() {
 	}
 
 	start := time.Now()
-	fmt.Printf("starting processing of queue (size: %d)...\n", len(b.queue))
+	fmt.Printf("starting processing of queue (keys: %d, messages: %d)...\n", len(b.queue), b.messageCount)
 	b.processing = true
 
 	// Extract all jobs to prevent concurrent map operations
@@ -117,7 +131,10 @@ func (b *Bundler) processQueue() {
 		<-b.results
 	}
 
-	fmt.Printf("processing of queue (size: %d) complete in %v\n", len(jobs), time.Since(start))
+	fmt.Printf("processing of queue (keys: %d, messages: %d) complete in %v\n",
+		len(jobs),
+		b.messageCount,
+		time.Since(start))
 }
 
 func (b *Bundler) jobWorker() {
@@ -136,7 +153,7 @@ func (b *Bundler) processJob(j job) {
 	b.deleteMutex.Unlock()
 
 	// Tell the queue processor that we're done
-	b.results <- true
+	b.results <- struct{}{}
 }
 
 func (b *Bundler) startTicker() {
@@ -167,7 +184,7 @@ func NewBundler(cfg Config) (*Bundler, error) {
 		config:  cfg,
 		queue:   make(map[string]Messages),
 		jobs:    make(chan job, cfg.NumGoroutines),
-		results: make(chan bool, cfg.CountThreshold),
+		results: make(chan struct{}, cfg.KeyCountThreshold),
 		ticker:  time.NewTicker(cfg.DelayThreshold),
 	}
 	b.startTicker()
